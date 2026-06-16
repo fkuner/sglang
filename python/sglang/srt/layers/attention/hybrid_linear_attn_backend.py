@@ -886,6 +886,13 @@ class HybridLinearAttnBackend(AttentionBackend):
         - index_select kernel launches
         - nonzero kernel launches
         """
+        linear_backend = getattr(
+            self.linear_attn_backend, "linear_backend", "seg_la"
+        )
+        if linear_backend == "cula":
+            self._cula_commit(last_correct_step_indices)
+            return
+
         request_number = last_correct_step_indices.shape[0]
 
         state_indices_tensor = (
@@ -934,3 +941,28 @@ class HybridLinearAttnBackend(AttentionBackend):
                 mamba_track_indices,
                 mamba_steps_to_track,
             )
+
+    def _cula_commit(self, last_correct_step_indices: torch.Tensor):
+        from sglang.srt.layers.attention.linear.cula_entry import cula_commit
+
+        request_number = last_correct_step_indices.shape[0]
+        cache_indices = (
+            self.linear_attn_backend.forward_metadata.mamba_cache_indices[
+                :request_number
+            ]
+        )
+        mamba_caches = (
+            self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+        )
+        accepted_len = (last_correct_step_indices + 1).clamp(min=0).to(torch.int32)
+        T = mamba_caches.draft_k.shape[2]
+        mamba_layer_ids = list(
+            self.linear_attn_backend.req_to_token_pool.mamba_map.keys()
+        )
+        decay_slopes = self.linear_attn_backend.tp_slope
+        for layer_id in mamba_layer_ids:
+            layer_idx = self.linear_attn_backend.req_to_token_pool.mamba_map[layer_id]
+            dk = mamba_caches.draft_k[layer_idx][cache_indices]
+            dv = mamba_caches.draft_v[layer_idx][cache_indices]
+            temporal = mamba_caches.temporal[layer_idx]
+            cula_commit(dk, dv, temporal, cache_indices, accepted_len, decay_slopes[layer_id], T)

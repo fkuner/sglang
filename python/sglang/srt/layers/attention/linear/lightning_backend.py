@@ -81,6 +81,67 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             f"linear_backend for linear attention in hybrid_linear_backend: {self.linear_backend}"
         )
 
+        if self.linear_backend == "cula":
+            self.head_dim = model_runner.model_config.hf_config.head_dim if hasattr(
+                model_runner.model_config.hf_config, "head_dim"
+            ) else (
+                model_runner.model_config.hf_config.hidden_size
+                // model_runner.model_config.hf_config.num_attention_heads
+            )
+            self.num_heads = total_num_heads // (
+                model_runner.tp_size if hasattr(model_runner, "tp_size") else 1
+            )
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        super().init_cuda_graph_state(max_bs, max_num_tokens)
+        if self.linear_backend == "cula":
+            self._warmup_cula_kernels(max_bs, max_num_tokens)
+
+    def _warmup_cula_kernels(self, max_bs: int, max_num_tokens: int):
+        from sglang.srt.layers.attention.linear.cula_entry import (
+            cula_decode,
+            cula_verify,
+        )
+
+        draft_token_num = max_num_tokens // max_bs
+        decay = self.tp_slope[0]
+        scale = self.head_dim**-0.5
+        temporal = self.req_to_token_pool.mamba_pool.mamba_cache.temporal[0]
+        dtype = torch.bfloat16
+
+        warmup_sizes = {1, 2, 4, 8, 16, 32, 33, 64, max_bs}
+        warmup_sizes = sorted(bs for bs in warmup_sizes if bs <= max_bs)
+        for bs in warmup_sizes:
+            dummy_q = torch.zeros(
+                (bs, self.num_heads, self.head_dim), device=self.device, dtype=dtype
+            )
+            dummy_out = torch.zeros_like(dummy_q)
+            dummy_idx = torch.zeros(bs, dtype=torch.int32, device=self.device)
+            cula_decode(
+                dummy_q, dummy_q, dummy_q, temporal, dummy_idx, decay, scale, dummy_out,
+            )
+            if draft_token_num > 1:
+                total = bs * draft_token_num
+                dummy_qv = torch.zeros(
+                    (total, self.num_heads, self.head_dim),
+                    device=self.device,
+                    dtype=dtype,
+                )
+                dummy_outv = torch.zeros_like(dummy_qv)
+                cula_verify(
+                    dummy_qv,
+                    dummy_qv,
+                    dummy_qv,
+                    temporal,
+                    dummy_idx,
+                    decay,
+                    scale,
+                    draft_token_num,
+                    dummy_outv,
+                )
+        torch.cuda.synchronize()
+        logger.info("cuLA kernel warmup complete")
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -328,6 +389,38 @@ class LightningAttentionBackend(MambaAttnBackendBase):
                 ),
                 intermediate_state_indices=intermediate_state_indices,
             )
+        elif self.linear_backend == "cula":
+            from sglang.srt.layers.attention.linear.cula_entry import (
+                cula_prefill,
+                cula_verify,
+            )
+
+            decay = self.tp_slope[layer_id]
+            scale = layer.head_dim**-0.5
+            if forward_batch.forward_mode.is_target_verify():
+                T = forward_batch.spec_info.draft_token_num
+                out = torch.empty_like(v)
+                o = cula_verify(
+                    q, k, v, ssm_states, cache_indices, decay, scale, T, out,
+                )
+                B = cache_indices.shape[0]
+                mamba_cache_params.draft_k[cache_indices] = k.view(
+                    B, T, *k.shape[1:]
+                ).to(torch.bfloat16)
+                mamba_cache_params.draft_v[cache_indices] = v.view(
+                    B, T, *v.shape[1:]
+                ).to(torch.bfloat16)
+            else:
+                o = cula_prefill(
+                    q,
+                    k,
+                    v,
+                    ssm_states,
+                    cache_indices,
+                    self.forward_metadata.query_start_loc,
+                    decay,
+                    scale,
+                )
         else:
             raise ValueError(
                 f"linear backend: {self.linear_backend} is not support for now"
@@ -374,6 +467,13 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             o = self._linear_attention_entry(
                 q, k, v, ssm_states, cache_indices, metadata, layer
             )
+        elif self.linear_backend == "cula":
+            from sglang.srt.layers.attention.linear.cula_entry import cula_decode
+
+            decay = self.tp_slope[layer_id]
+            scale = layer.head_dim**-0.5
+            out = torch.empty_like(v)
+            o = cula_decode(q, k, v, ssm_states, cache_indices, decay, scale, out)
         else:
             raise ValueError(
                 f"linear backend: {self.linear_backend} is not support for now"
