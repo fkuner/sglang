@@ -1,9 +1,9 @@
 import torch
 
 try:
-    from cula.ops.lightning_attn import lightning_attn_fwd_varlen
-    from cula.ops.la_decode import linear_attention_decode
     from cula.lightning import (
+        lightning_attn_fwd_varlen,
+        linear_attention_decode,
         linear_attention_verify_kvbuffer,
         linear_attention_state_update_kvbuffer,
     )
