@@ -10,6 +10,8 @@ import unittest
 import torch
 
 from sglang.srt.layers.attention.linear.seg_la import SegLaMeta, seg_la_fwd
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 try:
     from cula.lightning import (
@@ -20,6 +22,8 @@ try:
     CULA_AVAILABLE = True
 except ImportError:
     CULA_AVAILABLE = False
+
+register_cuda_ci(est_time=120, suite="base-b-test-4-gpu-b200")
 
 
 def _skip_if_no_gpu():
@@ -49,7 +53,7 @@ def _run_seg_la_mtp(q, k, v, state_kmajor, decay, scale, B, T, H, D):
 
 
 @unittest.skipUnless(CULA_AVAILABLE, "cuLA not installed (pip install cuda-linear-attention)")
-class TestCulaVsSegLaEquivalence(unittest.TestCase):
+class TestCulaVsSegLaEquivalence(CustomTestCase):
     """Validate cuLA verify/commit produces the same results as seg_la."""
 
     def test_cula_verify_matches_seg_la_mtp(self):

@@ -19,7 +19,7 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_
     run_lightning_eagle_verify_case,
 )
 
-register_cuda_ci(est_time=300, suite="nightly-8-gpu-common", nightly=True)
+register_cuda_ci(est_time=300, suite="base-b-test-4-gpu-b200")
 
 
 @unittest.skipUnless(CULA_AVAILABLE, "cuLA not installed (pip install cuda-linear-attention)")
