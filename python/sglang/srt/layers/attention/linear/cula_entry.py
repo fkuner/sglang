@@ -1,11 +1,36 @@
 import torch
 
-from cula.ops.lightning_attn import lightning_attn_fwd_varlen
-from cula.ops.la_decode import linear_attention_decode
-from cula.lightning import (
-    linear_attention_verify_kvbuffer,
-    linear_attention_state_update_kvbuffer,
-)
+try:
+    from cula.ops.lightning_attn import lightning_attn_fwd_varlen
+    from cula.ops.la_decode import linear_attention_decode
+    from cula.lightning import (
+        linear_attention_verify_kvbuffer,
+        linear_attention_state_update_kvbuffer,
+    )
+
+    CULA_AVAILABLE = True
+except ImportError:
+    CULA_AVAILABLE = False
+
+
+def _check_cula():
+    if not CULA_AVAILABLE:
+        raise ImportError(
+            "cuLA is required for linear_backend='cula'. "
+            "Install it from https://github.com/inclusionAI/cuLA:\n"
+            "  git clone https://github.com/inclusionAI/cuLA.git\n"
+            "  pip install -e cuLA --no-build-isolation\n"
+            "Requirements: Python 3.12+, CUDA 12.9+, PyTorch 2.9.1+."
+        )
+
+
+def _as_bf16(t: torch.Tensor) -> torch.Tensor:
+    """cuLA Lightning kernels are bf16-typed. Ling applies fp32 rotary, so q/k
+    reach the attention backend as fp32; cast to contiguous bf16 before the call.
+    """
+    if t.dtype != torch.bfloat16:
+        return t.to(torch.bfloat16).contiguous()
+    return t.contiguous()
 
 
 def cula_prefill(q, k, v, temporal, cache_indices, cu_seqlens, decay, scale):
@@ -21,6 +46,8 @@ def cula_prefill(q, k, v, temporal, cache_indices, cu_seqlens, decay, scale):
     Returns:
         o: [total_tokens, H, D] bf16
     """
+    _check_cula()
+    q, k, v = _as_bf16(q), _as_bf16(k), _as_bf16(v)
     total_tokens = q.shape[0]
     o, _ = lightning_attn_fwd_varlen(
         q.unsqueeze(0),
@@ -48,6 +75,10 @@ def cula_decode(q, k, v, temporal, cache_indices, decay, scale, out):
     Returns:
         out: [B, H, D] bf16
     """
+    _check_cula()
+    q, k, v = _as_bf16(q), _as_bf16(k), _as_bf16(v)
+    if out.dtype != torch.bfloat16:
+        out = torch.empty_like(v)
     HEAD_DIM = q.shape[-1]
     V_DIM = v.shape[-1]
     pool_size = temporal.shape[0]
@@ -88,6 +119,10 @@ def cula_verify(q, k, v, temporal, cache_indices, decay, scale, T, out):
     Returns:
         out reshaped to [B*T, HV, V]
     """
+    _check_cula()
+    q, k, v = _as_bf16(q), _as_bf16(k), _as_bf16(v)
+    if out.dtype != torch.bfloat16:
+        out = torch.empty_like(v)
     B = cache_indices.shape[0]
     H = q.shape[1]
     K = q.shape[2]
@@ -116,6 +151,7 @@ def cula_commit(draft_k, draft_v, temporal, cache_indices, accepted_len, decay, 
         decay: [H, 1, 1] fp32 positive slopes
         T: int draft_token_num
     """
+    _check_cula()
     linear_attention_state_update_kvbuffer(
         draft_k, draft_v, temporal, decay.view(-1),
         cache_indices.to(torch.int32), accepted_len.to(torch.int32), T,

@@ -384,13 +384,19 @@ class MambaPool:
                     HV, Kd, Vd = temporal_state_shape
                     T = speculative_num_draft_tokens
                     H = HV
+                    # draft_k/draft_v are indexed by the global mamba cache slot id
+                    # (mamba_cache_indices), which ranges over the `size`-based mamba
+                    # pool — NOT the spec_state_size (== max_num_reqs) pool. They must
+                    # therefore match the `temporal` state pool's leading dim (size + 1);
+                    # using spec_state_size + 1 here under-sizes the buffer and lets a
+                    # cache slot id >= spec_state_size+1 index out of bounds.
                     draft_k = torch.zeros(
-                        (num_mamba_layers, spec_state_size + 1, T, H, Kd),
+                        (num_mamba_layers, size + 1, T, H, Kd),
                         dtype=torch.bfloat16,
                         device=device,
                     )
                     draft_v = torch.zeros(
-                        (num_mamba_layers, spec_state_size + 1, T, HV, Vd),
+                        (num_mamba_layers, size + 1, T, HV, Vd),
                         dtype=torch.bfloat16,
                         device=device,
                     )

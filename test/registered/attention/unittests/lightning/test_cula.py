@@ -5,10 +5,12 @@ from pathlib import Path
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from sglang.srt.layers.attention.linear.cula_entry import CULA_AVAILABLE
 from sglang.test.kits.attention_unittest.attention_methods.lightning_attention import (
     LightningAttentionCase,
     run_lightning_attention_case,
@@ -17,7 +19,10 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_
     run_lightning_eagle_verify_case,
 )
 
+register_cuda_ci(est_time=300, suite="nightly-8-gpu-common", nightly=True)
 
+
+@unittest.skipUnless(CULA_AVAILABLE, "cuLA not installed (pip install cuda-linear-attention)")
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
 class TestCulaLightningBackendCorrectness(CustomTestCase):
     """Lightning attention backend correctness with linear_backend='cula'.
