@@ -18,6 +18,9 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
 
+# A/B toggle for cula decode path: "cula" (CuTe) or "seg_la" (Triton seg_la_d).
+_CULA_DECODE_BACKEND = "cula"
+
 
 class LightningAttentionBackend(MambaAttnBackendBase):
     """
@@ -110,6 +113,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             self.num_heads = total_num_heads // (
                 model_runner.tp_size if hasattr(model_runner, "tp_size") else 1
             )
+            logger.info(f"cula decode backend: {_CULA_DECODE_BACKEND}")
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         super().init_cuda_graph_state(max_bs, max_num_tokens)
@@ -121,6 +125,9 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             cula_commit_fused,
             cula_decode,
             cula_verify,
+        )
+        from sglang.srt.layers.attention.linear.linear_metadata import (
+            BailingLinearMetadata,
         )
 
         draft_token_num = max_num_tokens // max_bs
@@ -150,12 +157,13 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         verify_dtype = torch.float32
         out_dtype = torch.bfloat16
 
-        # decode is CUDA-graphed -> sparse warmup suffices. verify + commit use
-        # sym_int() for B (one compile covers all B) -> sparse warmup is enough.
         decode_warmup = sorted(
             bs for bs in {1, 2, 4, 8, 16, 32, 33, 64, max_bs} if bs <= max_bs
         )
         eager_warmup = [1, 32]  # trigger the single compile for verify + commit
+
+        class _WarmupLayer:
+            layer_id = 0
 
         for bs in decode_warmup:
             dummy_q = torch.zeros(
@@ -163,13 +171,38 @@ class LightningAttentionBackend(MambaAttnBackendBase):
                 device=self.device,
                 dtype=decode_dtype,
             )
-            dummy_out = torch.zeros(
-                (bs, self.num_heads, self.head_dim), device=self.device, dtype=out_dtype
-            )
             dummy_idx = torch.zeros(bs, dtype=torch.int32, device=self.device)
-            cula_decode(
-                dummy_q, dummy_q, dummy_q, temporal, dummy_idx, decay, scale, dummy_out
-            )
+            if _CULA_DECODE_BACKEND == "cula":
+                dummy_out = torch.zeros(
+                    (bs, self.num_heads, self.head_dim),
+                    device=self.device,
+                    dtype=out_dtype,
+                )
+                cula_decode(
+                    dummy_q,
+                    dummy_q,
+                    dummy_q,
+                    temporal,
+                    dummy_idx,
+                    decay,
+                    scale,
+                    dummy_out,
+                )
+            else:
+                seq_lens = torch.ones(bs, dtype=torch.int32, device=self.device)
+                qsl = torch.arange(0, bs + 1, dtype=torch.int32, device=self.device)
+                decode_meta = BailingLinearMetadata.prepare_decode(
+                    qsl, dummy_idx, bs, seq_lens
+                )
+                self._linear_attention_entry(
+                    dummy_q,
+                    dummy_q,
+                    dummy_q,
+                    temporal,
+                    dummy_idx,
+                    decode_meta,
+                    _WarmupLayer(),
+                )
         if draft_token_num > 1:
             for bs in eager_warmup:
                 total = bs * draft_token_num
@@ -220,8 +253,8 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         temporal_full.zero_()
         torch.cuda.synchronize()
         logger.info(
-            f"cuLA kernel warmup complete (decode={len(decode_warmup)} bs, "
-            f"eager verify+commit={len(eager_warmup)} bs)"
+            f"cuLA kernel warmup complete (decode={_CULA_DECODE_BACKEND}, "
+            f"{len(decode_warmup)} bs, eager verify+commit={len(eager_warmup)} bs)"
         )
 
     def init_forward_metadata_out_graph(
@@ -556,14 +589,19 @@ class LightningAttentionBackend(MambaAttnBackendBase):
                 q, k, v, ssm_states, cache_indices, metadata, layer
             )
         elif self.linear_backend == "cula":
-            from sglang.srt.layers.attention.linear.cula_entry import cula_decode
+            if _CULA_DECODE_BACKEND == "cula":
+                from sglang.srt.layers.attention.linear.cula_entry import cula_decode
 
-            decay = self.tp_slope[layer_id]
-            scale = layer.head_dim**-0.5
-            # Pass q/k/v through in native dtype (fp32); cula_decode computes in
-            # fp32 internally. Pre-allocated bf16 out so no graph re-alloc.
-            out = torch.empty_like(v, dtype=torch.bfloat16)
-            o = cula_decode(q, k, v, ssm_states, cache_indices, decay, scale, out)
+                decay = self.tp_slope[layer_id]
+                scale = layer.head_dim**-0.5
+                out = torch.empty_like(v, dtype=torch.bfloat16)
+                o = cula_decode(
+                    q, k, v, ssm_states, cache_indices, decay, scale, out
+                )
+            else:
+                o = self._linear_attention_entry(
+                    q, k, v, ssm_states, cache_indices, metadata, layer
+                )
         else:
             raise ValueError(
                 f"linear backend: {self.linear_backend} is not support for now"
