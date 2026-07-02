@@ -144,9 +144,17 @@ class ModelRunnerKVCacheMixin:
         assert config is not None
 
         has_spec_dec = not self.spec_algorithm.is_none()
+        linear_backend = getattr(
+            self.model_config.hf_config, "linear_backend", "seg_la"
+        )
         if has_spec_dec:
             assert server_args.speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
+        cula_draft_kv_cache_per_slot = (
+            self._cula_draft_kv_cache_per_slot()
+            if has_spec_dec and linear_backend == "cula"
+            else None
+        )
 
         if server_args.max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
@@ -155,17 +163,23 @@ class ModelRunnerKVCacheMixin:
             )
             # Reserve intermediate memory based on capped max_num_reqs
             if has_spec_dec:
-                ratio = self._calculate_mamba_ratio()
-                capped_reqs = min(
-                    server_args.max_running_requests
-                    // (self.dp_size if server_args.enable_dp_attention else 1),
-                    server_args.max_mamba_cache_size // ratio,
-                )
-                intermediate_size = (
-                    config.mamba2_cache_params.mamba_cache_per_req
-                    * capped_reqs
-                    * server_args.speculative_num_draft_tokens
-                )
+                if cula_draft_kv_cache_per_slot is not None:
+                    intermediate_size = (
+                        cula_draft_kv_cache_per_slot
+                        * server_args.max_mamba_cache_size
+                    )
+                else:
+                    ratio = self._calculate_mamba_ratio()
+                    capped_reqs = min(
+                        server_args.max_running_requests
+                        // (self.dp_size if server_args.enable_dp_attention else 1),
+                        server_args.max_mamba_cache_size // ratio,
+                    )
+                    intermediate_size = (
+                        config.mamba2_cache_params.mamba_cache_per_req
+                        * capped_reqs
+                        * server_args.speculative_num_draft_tokens
+                    )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         elif (
             server_args.disable_radix_cache
@@ -177,22 +191,26 @@ class ModelRunnerKVCacheMixin:
             )
             # Reserve intermediate memory based on capped max_num_reqs
             if has_spec_dec:
-                intermediate_size = (
-                    config.mamba2_cache_params.mamba_cache_per_req
-                    * server_args.max_mamba_cache_size
-                    * server_args.speculative_num_draft_tokens
-                )
+                if cula_draft_kv_cache_per_slot is not None:
+                    intermediate_size = (
+                        cula_draft_kv_cache_per_slot
+                        * server_args.max_mamba_cache_size
+                    )
+                else:
+                    intermediate_size = (
+                        config.mamba2_cache_params.mamba_cache_per_req
+                        * server_args.max_mamba_cache_size
+                        * server_args.speculative_num_draft_tokens
+                    )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         else:
             # Use ratio-based calculation to auto-fit available memory
             assert config.mamba2_cache_params.mamba_cache_per_req > 0
             per_req = config.mamba2_cache_params.mamba_cache_per_req
 
-            # Solve jointly for max_mamba_cache_size accounting for intermediate memory.
-            # The mamba budget (from the ratio split) must cover both:
-            #   1. main mamba state: max_mamba_cache_size * per_req
-            #   2. intermediate states: (max_mamba_cache_size / ratio) * D * per_req
-            # So: max_mamba_cache_size * per_req * (1 + D/ratio) = mamba_budget_bytes
+            # Solve jointly for max_mamba_cache_size accounting for speculative
+            # auxiliary buffers. seg_la keeps the old max-request-indexed
+            # intermediate states; cuLA keeps pool-indexed fp32 draft K/V.
             mamba_budget = (
                 total_rest_memory
                 * server_args.mamba_full_memory_ratio
@@ -201,20 +219,32 @@ class ModelRunnerKVCacheMixin:
             mamba_budget_bytes = mamba_budget * (1 << 30)
 
             if has_spec_dec:
-                ratio = self._calculate_mamba_ratio()
-                D = server_args.speculative_num_draft_tokens
-                # Joint solve: main_state + intermediate = mamba_budget
-                server_args.max_mamba_cache_size = int(
-                    mamba_budget_bytes // (per_req * (1 + D / ratio))
-                )
-                # Intermediate memory is included in mamba_budget, subtract it
-                # so the return value only has main_state subtracted from total
-                capped_reqs = min(
-                    server_args.max_running_requests
-                    // (self.dp_size if server_args.enable_dp_attention else 1),
-                    server_args.max_mamba_cache_size // ratio,
-                )
-                intermediate_size = per_req * capped_reqs * D
+                if cula_draft_kv_cache_per_slot is not None:
+                    # cuLA draft K/V buffers are pool-indexed by mamba cache
+                    # slot, so they scale with max_mamba_cache_size.
+                    server_args.max_mamba_cache_size = int(
+                        mamba_budget_bytes
+                        // (per_req + cula_draft_kv_cache_per_slot)
+                    )
+                    intermediate_size = (
+                        cula_draft_kv_cache_per_slot
+                        * server_args.max_mamba_cache_size
+                    )
+                else:
+                    ratio = self._calculate_mamba_ratio()
+                    D = server_args.speculative_num_draft_tokens
+                    # Joint solve: main_state + intermediate = mamba_budget
+                    server_args.max_mamba_cache_size = int(
+                        mamba_budget_bytes // (per_req * (1 + D / ratio))
+                    )
+                    # Intermediate memory is included in mamba_budget, subtract it
+                    # so the return value only has main_state subtracted from total
+                    capped_reqs = min(
+                        server_args.max_running_requests
+                        // (self.dp_size if server_args.enable_dp_attention else 1),
+                        server_args.max_mamba_cache_size // ratio,
+                    )
+                    intermediate_size = per_req * capped_reqs * D
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
                 server_args.max_mamba_cache_size = int(mamba_budget_bytes // per_req)
@@ -241,6 +271,25 @@ class ModelRunnerKVCacheMixin:
             / (1 << 30)
         )
         return total_rest_memory - mamba_state_memory
+
+    def _cula_draft_kv_cache_per_slot(self: ModelRunner) -> int:
+        """Bytes per mamba cache slot for cuLA KVBuffer draft K/V buffers."""
+        cache_params = self.mambaish_config.mamba2_cache_params
+        num_layers = len(
+            [
+                i
+                for i in cache_params.layers
+                if self.start_layer <= i < self.end_layer
+            ]
+        )
+        hidden_groups, key_dim, value_dim = cache_params.shape.temporal
+        draft_tokens = self.server_args.speculative_num_draft_tokens
+        return (
+            num_layers
+            * draft_tokens
+            * (hidden_groups * key_dim + hidden_groups * value_dim)
+            * torch.float32.itemsize
+        )
 
     def calculate_mla_kv_cache_dim(self: ModelRunner) -> int:
         is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
@@ -563,6 +612,9 @@ class ModelRunnerKVCacheMixin:
                         enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                         mamba_size=self.server_args.max_mamba_cache_size,
                         start_layer=self.start_layer,
+                        linear_backend=getattr(
+                            self.model_config.hf_config, "linear_backend", "seg_la"
+                        ),
                     )
                 else:
                     self.req_to_token_pool = DecodeReqToTokenPool(

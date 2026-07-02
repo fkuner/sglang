@@ -198,6 +198,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         mamba_size: int = None,
         start_layer: int = None,
         speculative_eagle_topk: Optional[int] = None,
+        linear_backend: str = "seg_la",
     ):
         DecodeReqToTokenPool.__init__(
             self,
@@ -242,6 +243,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             enable_mamba_extra_buffer=self.enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_eagle_topk=speculative_eagle_topk,
+            linear_backend=linear_backend,
         )
 
     def clear(self):
